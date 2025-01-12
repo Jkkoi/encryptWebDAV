@@ -5,6 +5,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -14,32 +15,142 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/fsnotify/fsnotify"
 )
 
 const (
 	// Define the chunk size as 4MB
-	chunkSize = 10 * 1024 * 1024 // 10MB
+	chunkSize       = 10 * 1024 * 1024 // 10MB
+	defaultCertPath = "/etc/letsencrypt/live"
 )
+
+type ServerConfig struct {
+	Port           string
+	CertFile       string
+	KeyFile        string
+	Domain         string
+	UseLetsEncrypt bool
+}
 
 // Entry point of the application
 func main() {
+	// Initialize the configuration
+	config := &ServerConfig{
+		CertFile: os.Getenv("CERT_FILE"),
+		KeyFile:  os.Getenv("KEY_FILE"),
+		Domain:   os.Getenv("DOMAIN"),
+		Port:     os.Getenv("PORT"),
+	}
+
+	// 如果PORT未设置，根据是否使用SSL来设置默认端口
+	if config.Port == "" {
+		if config.Domain != "" || (config.CertFile != "" && config.KeyFile != "") {
+			config.Port = "443" // HTTPS默认端口
+		} else {
+			config.Port = "80" // HTTP默认端口
+		}
+	}
+
 	// Initialize the WebDAV handler
 	handler := &webDAVHandler{}
 
-	// Define the server address (can be configured via environment variable)
-	addr := ":8080" // Default port
-	if port, exists := os.LookupEnv("PORT"); exists {
-		addr = ":" + port
+	// Set up the server
+	server := &http.Server{
+		Addr:    ":" + config.Port,
+		Handler: handler,
 	}
 
-	// Start the HTTP server
-	log.Printf("Starting WebDAV encryption server on %s", addr)
-	err := http.ListenAndServe(addr, handler)
+	// Check if SSL is being used
+	if config.Domain != "" {
+		// Use Let's Encrypt certificates
+		config.UseLetsEncrypt = true
+		config.CertFile = filepath.Join(defaultCertPath, config.Domain, "fullchain.pem")
+		config.KeyFile = filepath.Join(defaultCertPath, config.Domain, "privkey.pem")
+	}
+
+	if config.CertFile != "" && config.KeyFile != "" {
+		// Start certificate monitoring
+		go watchCertificates(config, server)
+
+		// Load initial certificates
+		cert, err := tls.LoadX509KeyPair(config.CertFile, config.KeyFile)
+		if err != nil {
+			log.Fatalf("Failed to load certificate: %v", err)
+		}
+
+		server.TLSConfig = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+		}
+
+		log.Printf("Starting HTTPS server on :%s", config.Port)
+		if err := server.ListenAndServeTLS("", ""); err != nil {
+			log.Fatalf("Server failed: %v", err)
+		}
+	} else {
+		// Start HTTP server
+		log.Printf("Starting HTTP server on :%s", config.Port)
+		if err := server.ListenAndServe(); err != nil {
+			log.Fatalf("Server failed: %v", err)
+		}
+	}
+}
+
+// Add certificate monitoring function
+func watchCertificates(config *ServerConfig, server *http.Server) {
+	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		log.Fatalf("Server failed: %v", err)
+		log.Printf("Failed to create watcher: %v", err)
+		return
+	}
+	defer watcher.Close()
+
+	// Watch the directory containing certificate files
+	certDir := filepath.Dir(config.CertFile)
+	err = watcher.Add(certDir)
+	if err != nil {
+		log.Printf("Failed to watch certificate directory: %v", err)
+		return
+	}
+
+	log.Printf("Watching for certificate changes in: %s", certDir)
+
+	for {
+		select {
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return
+			}
+
+			// Check if a certificate file has changed
+			if (event.Name == config.CertFile || event.Name == config.KeyFile) &&
+				(event.Op&fsnotify.Write == fsnotify.Write || event.Op&fsnotify.Create == fsnotify.Create) {
+
+				// Wait for the file to finish writing
+				time.Sleep(1 * time.Second)
+
+				// Reload certificates
+				cert, err := tls.LoadX509KeyPair(config.CertFile, config.KeyFile)
+				if err != nil {
+					log.Printf("Failed to reload certificate: %v", err)
+					continue
+				}
+
+				// Update server certificates
+				server.TLSConfig.Certificates = []tls.Certificate{cert}
+				log.Printf("Certificate reloaded successfully")
+			}
+
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return
+			}
+			log.Printf("Watcher error: %v", err)
+		}
 	}
 }
 
